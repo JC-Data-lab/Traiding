@@ -3,7 +3,8 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, date, time as dtime, timezone
+from zoneinfo import ZoneInfo
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 BINANCE_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
@@ -11,13 +12,14 @@ BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER_PRICE = "https://api.binance.com/api/v3/ticker/price"
 
 INTERVAL = "1d"
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 
-def fetch_json_with_retries(url: str, params: dict, timeout: int = 30, tries: int = 3) -> list | dict:
+def safe_get_json(url: str, params: dict | None = None, timeout: int = 30, tries: int = 4):
     """
-    Requêtes HTTP robustes (utile sur Streamlit Cloud).
-    - Retry sur 429/5xx et certaines erreurs réseau.
-    - Backoff progressif.
+    Requête HTTP robuste pour Streamlit Cloud (IP partagée => rate limit / blocage possible).
+    - Ajoute un User-Agent
+    - Retry + backoff sur 429/5xx et erreurs réseau
     """
     last_exc = None
     for attempt in range(1, tries + 1):
@@ -27,11 +29,12 @@ def fetch_json_with_retries(url: str, params: dict, timeout: int = 30, tries: in
                 params=params,
                 timeout=timeout,
                 headers={
-                    # Certains endpoints sont plus stables avec un UA explicite
-                    "User-Agent": "Mozilla/5.0 (StreamlitApp; +https://streamlit.io)"
+                    "User-Agent": "Mozilla/5.0 (StreamlitApp; +https://streamlit.io)",
+                    "Accept": "application/json",
                 },
             )
-            # Retry sur rate limit / erreurs serveurs
+
+            # Retry sur rate limit / erreurs temporaires
             if r.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
 
@@ -40,8 +43,7 @@ def fetch_json_with_retries(url: str, params: dict, timeout: int = 30, tries: in
 
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
             last_exc = e
-            # backoff: 1s, 2s, 4s ...
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(2 ** (attempt - 1))  # 1s,2s,4s,8s
 
     raise last_exc
 
@@ -57,21 +59,13 @@ def get_top_coins(vs_currency: str, top_n: int) -> pd.DataFrame:
     }
 
     try:
-        data = fetch_json_with_retries(COINGECKO_URL, params=params, timeout=30, tries=3)
+        data = safe_get_json(COINGECKO_URL, params=params, timeout=30, tries=4)
     except requests.HTTPError as e:
         code = getattr(e.response, "status_code", None)
-        st.error(
-            "Erreur CoinGecko. "
-            f"Statut HTTP: {code}. "
-            "Sur Streamlit Cloud, CoinGecko peut limiter/bloquer certaines IP. "
-            "Réessaie plus tard ou utilise un autre provider."
-        )
+        st.error(f"CoinGecko inaccessible (HTTP {code}). Réessaie dans 1–2 minutes.")
         st.stop()
-    except Exception as e:
-        st.error(
-            "Erreur réseau lors de l’appel CoinGecko. "
-            "Réessaie. Si ça persiste, il faudra passer sur un autre provider (CoinMarketCap/CMC, CryptoCompare, etc.)."
-        )
+    except Exception:
+        st.error("CoinGecko inaccessible (erreur réseau). Réessaie dans 1–2 minutes.")
         st.stop()
 
     df = pd.DataFrame(data)[["market_cap_rank", "name", "symbol"]]
@@ -81,26 +75,92 @@ def get_top_coins(vs_currency: str, top_n: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)  # 1h
 def get_binance_symbols_set() -> set[str]:
-    r = requests.get(BINANCE_EXCHANGE_INFO, timeout=30)
-    r.raise_for_status()
-    info = r.json()
+    try:
+        info = safe_get_json(BINANCE_EXCHANGE_INFO, params=None, timeout=30, tries=4)
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        st.error(
+            f"Binance exchangeInfo inaccessible (HTTP {code}). "
+            "Sur Streamlit Cloud, Binance peut bloquer/rate-limit l’IP. Réessaie plus tard."
+        )
+        st.stop()
+    except Exception:
+        st.error(
+            "Binance exchangeInfo inaccessible (erreur réseau). "
+            "Sur Streamlit Cloud, Binance peut bloquer/rate-limit l’IP. Réessaie plus tard."
+        )
+        st.stop()
+
     return {s["symbol"] for s in info["symbols"] if s.get("status") == "TRADING"}
 
 
 @st.cache_data(ttl=30)  # 30s : prix live
 def get_live_price(symbol: str) -> float:
-    r = requests.get(BINANCE_TICKER_PRICE, params={"symbol": symbol}, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return float(data["price"])
+    try:
+        data = safe_get_json(BINANCE_TICKER_PRICE, params={"symbol": symbol}, timeout=10, tries=3)
+        return float(data["price"])
+    except Exception:
+        return np.nan
 
 
-@st.cache_data(ttl=300)  # 5 min
+@st.cache_data(ttl=3600)  # historique intraday (15:00) : cache long
+def get_price_at_paris_time(symbol: str, ref_date: date, hour: int = 15, minute: int = 0, interval: str = "1m"):
+    """
+    Prix à ~15:00 heure de Paris (DST auto).
+    """
+    target_paris = datetime.combine(ref_date, dtime(hour=hour, minute=minute), tzinfo=PARIS_TZ)
+    target_utc = target_paris.astimezone(timezone.utc)
+    target_ms = int(target_utc.timestamp() * 1000)
+
+    start_ms = target_ms - 3 * 60_000
+    end_ms = target_ms + 3 * 60_000
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": 10,
+    }
+
+    try:
+        klines = safe_get_json(BINANCE_KLINES, params=params, timeout=20, tries=3)
+    except Exception:
+        return np.nan, None
+
+    if not klines:
+        return np.nan, None
+
+    best = None
+    best_diff = None
+    for k in klines:
+        ot = int(k[0])
+        diff = abs(ot - target_ms)
+        if best is None or diff < best_diff:
+            best = k
+            best_diff = diff
+
+    if best is None:
+        return np.nan, None
+
+    open_time_utc = datetime.fromtimestamp(int(best[0]) / 1000, tz=timezone.utc)
+    price_close = float(best[4])  # close
+    return price_close, open_time_utc
+
+
+@st.cache_data(ttl=300)  # 5 min : historique daily
 def get_klines(symbol: str, interval: str = "1d", limit: int = 400) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_KLINES, params=params, timeout=30)
-    r.raise_for_status()
-    klines = r.json()
+
+    try:
+        klines = safe_get_json(BINANCE_KLINES, params=params, timeout=30, tries=4)
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        st.error(f"Binance klines inaccessible pour {symbol} (HTTP {code}).")
+        st.stop()
+    except Exception:
+        st.error(f"Binance klines inaccessible pour {symbol} (erreur réseau).")
+        st.stop()
 
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
@@ -119,7 +179,7 @@ def get_klines(symbol: str, interval: str = "1d", limit: int = 400) -> pd.DataFr
     return df[["date_utc", "open_time", "close_time", "close", "volume", "quote_asset_volume"]].dropna()
 
 
-def get_close_on_or_before(df: pd.DataFrame, ref_date):
+def get_close_on_or_before(df: pd.DataFrame, ref_date: date):
     if df.empty:
         return np.nan, None, None
 
@@ -130,12 +190,10 @@ def get_close_on_or_before(df: pd.DataFrame, ref_date):
 
     d = candidates[-1]
     row = df.loc[df["date_utc"] == d].sort_values("open_time").iloc[-1]
-    close_price = float(row["close"])
-    close_time_utc = row["close_time"]
-    return close_price, d, close_time_utc
+    return float(row["close"]), d, row["close_time"]
 
 
-def compute_metrics(df: pd.DataFrame, ref_date, window_days: int) -> tuple[float, float, object]:
+def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int):
     if df.empty:
         return np.nan, np.nan, None
 
@@ -156,7 +214,6 @@ def compute_metrics(df: pd.DataFrame, ref_date, window_days: int) -> tuple[float
     closes = w["close"].to_numpy()
     log_returns = np.log(closes[1:] / closes[:-1])
     vol = float(np.std(log_returns, ddof=1))
-
     liq = float(w["quote_asset_volume"].mean())
     return vol, liq, d
 
@@ -168,7 +225,9 @@ def format_table(out: pd.DataFrame) -> pd.DataFrame:
     def r6(x): return None if pd.isna(x) else round(float(x), 6)
 
     out2["Price (Live)"] = out2["Price (Live)"].map(r2)
+    out2["Price (15:00 Paris)"] = out2["Price (15:00 Paris)"].map(r2)
     out2["Price (Close 1D)"] = out2["Price (Close 1D)"].map(r2)
+
     out2["Volatility"] = out2["Volatility"].map(r6)
     out2["Liquidity"] = out2["Liquidity"].map(lambda x: None if pd.isna(x) else round(float(x), 2))
     out2["Score"] = out2["Score"].map(lambda x: None if pd.isna(x) else round(float(x), 2))
@@ -176,7 +235,7 @@ def format_table(out: pd.DataFrame) -> pd.DataFrame:
 
     cols = [
         "Rank (MC)", "Crypto", "Symbol",
-        "Price (Live)", "Price (Close 1D)",
+        "Price (Live)", "Price (15:00 Paris)", "Price (Close 1D)",
         "Volatility", "Liquidity", "Score", "%"
     ]
     return out2[cols]
@@ -184,7 +243,7 @@ def format_table(out: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     st.set_page_config(page_title="Crypto Volatility x Liquidity", layout="wide")
-    st.title("Top Crypto — Volatilité & Liquidité (CoinGecko + Binance)")
+    st.title("Top 10 Crypto — Volatilité & Liquidité (CoinGecko + Binance)")
 
     with st.sidebar:
         st.subheader("Paramètres")
@@ -194,11 +253,16 @@ def main():
         quote = st.selectbox("Paire Binance (quote)", ["USDT"], index=0)
 
         ref_date = st.date_input("Date de référence (Close 1D + métriques)", value=datetime.utcnow().date())
+        show_15h = st.checkbox("Afficher Price (15:00 Paris)", value=True)
+
         run = st.button("Calculer / Rafraîchir")
 
     st.caption(
-        "Prix : Price (Live) = dernier prix échangé Binance (comme TradingView Last). "
-        "Price (Close 1D) = clôture daily Binance (UTC). Daily = 00:00 → 23:59 UTC."
+        "Prix : "
+        "**Price (Live)** = dernier prix échangé (Binance) = TradingView (Last). "
+        "**Price (15:00 Paris)** = close de la bougie 1m autour de 15:00 Europe/Paris (DST auto). "
+        "**Price (Close 1D)** = clôture daily Binance en UTC. "
+        "Daily Binance : 00:00 → 23:59 UTC."
     )
 
     if not run:
@@ -212,6 +276,7 @@ def main():
     skipped = []
     used_dates = set()
     used_close_times = []
+    used_15h_times = []
 
     progress = st.progress(0)
     for i, (_, r) in enumerate(top.iterrows(), start=1):
@@ -223,12 +288,17 @@ def main():
             progress.progress(i / len(top))
             continue
 
-        try:
-            price_live = get_live_price(pair)
-        except Exception:
-            price_live = np.nan
+        price_live = get_live_price(pair)
+
+        price_15h = np.nan
+        time_15h_utc = None
+        if show_15h:
+            price_15h, time_15h_utc = get_price_at_paris_time(pair, ref_date, hour=15, minute=0, interval="1m")
+            if time_15h_utc is not None:
+                used_15h_times.append(time_15h_utc)
 
         k = get_klines(pair, INTERVAL, limit=400)
+
         price_close_1d, used_date_price, close_time_utc = get_close_on_or_before(k, ref_date)
         vol, liq, used_date_metrics = compute_metrics(k, ref_date, int(window_days))
 
@@ -243,6 +313,7 @@ def main():
             "Crypto": r["name"],
             "Symbol": sym,
             "Price (Live)": price_live,
+            "Price (15:00 Paris)": price_15h,
             "Price (Close 1D)": price_close_1d,
             "Volatility": vol,
             "Liquidity": liq,
@@ -258,22 +329,33 @@ def main():
         return
 
     out = pd.DataFrame(rows)
+
+    if not show_15h and "Price (15:00 Paris)" in out.columns:
+        out = out.drop(columns=["Price (15:00 Paris)"])
+
     out["Score"] = out["Volatility"] * out["Liquidity"]
     total_score = out["Score"].sum(skipna=True)
     out["%"] = (out["Score"] / total_score * 100) if total_score and total_score > 0 else np.nan
     out = out.sort_values("Score", ascending=False)
 
     effective_date = max(used_dates) if used_dates else ref_date
-    if used_close_times:
-        effective_close_time_utc = max(used_close_times)
-        st.caption(
-            f"Date utilisée : {effective_date} | Fenêtre : {window_days} jours | Quote : {quote} | "
-            f"Clôture daily (UTC) : {effective_close_time_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-        )
-    else:
-        st.caption(f"Date utilisée : {effective_date} | Fenêtre : {window_days} jours | Quote : {quote}")
 
-    st.dataframe(format_table(out), use_container_width=True)
+    info_parts = [
+        f"Date utilisée (daily/métriques) : {effective_date}",
+        f"Fenêtre : {window_days} jours",
+        f"Quote : {quote}"
+    ]
+    if used_close_times:
+        info_parts.append(f"Clôture daily (UTC) : {max(used_close_times).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    if show_15h and used_15h_times:
+        info_parts.append(f"Point 15:00 Paris (UTC utilisé) : {max(used_15h_times).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    st.caption(" | ".join(info_parts))
+
+    st.dataframe(
+        format_table(out) if show_15h else format_table(out.drop(columns=["Price (15:00 Paris)"], errors="ignore")),
+        use_container_width=True
+    )
 
     if skipped:
         st.warning("Paires absentes sur Binance (ignorées) : " + ", ".join(skipped))

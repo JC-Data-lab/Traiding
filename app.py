@@ -278,7 +278,7 @@ def main():
         st.subheader("Paramètres")
 
         vs_currency = st.selectbox("Devise (CoinGecko)", ["usd", "eur"], index=0)
-        top_n = st.number_input("Top N", min_value=5, max_value=50, value=10, step=1)
+        top_n = st.number_input("Top N", min_value=1, max_value=50, value=10, step=1)
         window_days = st.slider("Fenêtre (N jours)", min_value=7, max_value=120, value=30, step=1)
         ref_date = st.date_input("Date de référence (daily)", value=datetime.utcnow().date())
         show_15h = st.checkbox("Afficher Price (15:00 Paris)", value=True)

@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime, date, time as dtime, timezone
+from datetime import datetime, date, time as dtime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 # ---------- CONFIG ----------
@@ -42,6 +42,18 @@ def safe_get_json(url: str, params: dict | None = None, timeout: int = 30, tries
             last_exc = e
             time.sleep(2 ** (attempt - 1))
     raise last_exc
+
+
+def mondays_of_year(year: int) -> list[date]:
+    """Retourne tous les lundis de l'année."""
+    d = date(year, 1, 1)
+    while d.weekday() != 0:  # Monday=0
+        d += timedelta(days=1)
+    out = []
+    while d.year == year:
+        out.append(d)
+        d += timedelta(days=7)
+    return out
 
 
 # ---------- COINGECKO ----------
@@ -86,14 +98,12 @@ def get_histoday_cc(fsym: str, tsym: str, limit: int = 400, to_ts: int | None = 
 
     j = safe_get_json(CC_HISTODAY, params=params, timeout=30, tries=4)
 
-    # Structure v2: {"Response":"Success","Data":{"Data":[...]}}
     if j.get("Response") != "Success":
         raise requests.HTTPError(f"CryptoCompare histoday error: {j.get('Message', 'Unknown')}")
 
     rows = j["Data"]["Data"]
     df = pd.DataFrame(rows)
 
-    # champs usuels: time, close, volumeto, volumefrom, open, high, low
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df["date_utc"] = df["time"].dt.date
 
@@ -105,10 +115,12 @@ def get_histoday_cc(fsym: str, tsym: str, limit: int = 400, to_ts: int | None = 
 
 
 @st.cache_data(ttl=3600)  # 1h
-def get_price_at_paris_15h_cc(fsym: str, tsym: str, ref_date: date, hour: int = 15) -> tuple[float, datetime | None]:
+def get_price_at_paris_15h_cc(
+    fsym: str, tsym: str, ref_date: date, hour: int = 15
+) -> tuple[float, datetime | None]:
     """
     Prix au plus proche de 15:00 Europe/Paris via histohour.
-    On récupère un petit bloc d'heures autour de l'instant cible (UTC) et on prend l'heure la plus proche.
+    (On prend le CLOSE 1H de l'heure la plus proche.)
     """
     target_paris = datetime.combine(ref_date, dtime(hour=hour, minute=0), tzinfo=PARIS_TZ)
     target_utc = target_paris.astimezone(timezone.utc)
@@ -117,7 +129,7 @@ def get_price_at_paris_15h_cc(fsym: str, tsym: str, ref_date: date, hour: int = 
     params = {
         "fsym": fsym,
         "tsym": tsym,
-        "limit": 6,     # quelques heures autour
+        "limit": 6,
         "toTs": target_ts,
     }
 
@@ -150,6 +162,47 @@ def get_price_at_paris_15h_cc(fsym: str, tsym: str, ref_date: date, hour: int = 
         return np.nan, None
 
 
+@st.cache_data(ttl=3600)  # 1h
+def build_monday_15h_index_2025(fsym: str, tsym: str, hour: int = 15) -> pd.DataFrame:
+    """
+    Construit un indice base 100 sur tous les lundis 2025 à 15:00 Paris,
+    basé sur le Close 1H (CryptoCompare histohour).
+    """
+    mondays = mondays_of_year(2025)
+
+    rows = []
+    for d in mondays:
+        p, used_utc = get_price_at_paris_15h_cc(fsym, tsym, d, hour=hour)
+        rows.append(
+            {
+                "Monday": d,
+                "Price (Close 1H @ 15:00 Paris)": p,
+                "UTC used": used_utc,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    # Nettoyage
+    df["Monday"] = pd.to_datetime(df["Monday"])
+    df["Price (Close 1H @ 15:00 Paris)"] = pd.to_numeric(df["Price (Close 1H @ 15:00 Paris)"], errors="coerce")
+    df = df.dropna(subset=["Price (Close 1H @ 15:00 Paris)"]).sort_values("Monday")
+
+    if df.empty or len(df) < 2:
+        df["Index (Base 100)"] = np.nan
+        return df
+
+    # Indice base 100
+    prices = df["Price (Close 1H @ 15:00 Paris)"].to_numpy()
+    idx = np.zeros(len(prices), dtype=float)
+    idx[0] = 100.0
+    for i in range(1, len(prices)):
+        idx[i] = idx[i - 1] * (prices[i] / prices[i - 1])
+
+    df["Index (Base 100)"] = idx
+    return df
+
+
 # ---------- METRICS ----------
 def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int) -> tuple[float, float, date | None]:
     """
@@ -177,7 +230,7 @@ def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int) -> tuple
     log_returns = np.log(closes[1:] / closes[:-1])
     vol = float(np.std(log_returns, ddof=1))
 
-    liq = float(w["volumeto"].mean())  # proxy liquidité (volume "quote" tsym)
+    liq = float(w["volumeto"].mean())
     return vol, liq, d
 
 
@@ -230,22 +283,24 @@ def main():
         ref_date = st.date_input("Date de référence (daily)", value=datetime.utcnow().date())
         show_15h = st.checkbox("Afficher Price (15:00 Paris)", value=True)
 
+        # Graph (lundis 2025)
+        st.divider()
+        show_graph = st.checkbox("Afficher le graphique (lundis 15h 2025)", value=True)
+
         run = st.button("Calculer / Rafraîchir")
 
-    # Mapping devise -> tsym CryptoCompare
     tsym = "USD" if vs_currency.lower() == "usd" else "EUR"
 
     st.caption(
         "Sources : CoinGecko (Top coins) + CryptoCompare (prix + OHLCV + volumes). "
-        "Interprétation simple : plus la **Volatility** est grande, plus ça bouge ; plus la **Liquidity** est grande, "
-        "plus ça se trade (volume). **Score = Volatility × Liquidity** ; **%** = part du score dans le total."
+        "Interprétation : Volatility ↑ = ça bouge plus ; Liquidity ↑ = volume plus élevé ; "
+        "Score = Volatility × Liquidity ; % = part du score."
     )
 
     if not run:
         st.info("Clique sur « Calculer / Rafraîchir » pour générer le tableau.")
         return
 
-    # Vérif secret
     if not st.secrets.get("CRYPTOCOMPARE_API_KEY"):
         st.error("Secret manquant : CRYPTOCOMPARE_API_KEY. Va dans Streamlit Cloud → Settings → Secrets.")
         st.stop()
@@ -262,11 +317,9 @@ def main():
     for i, (_, r) in enumerate(top.iterrows(), start=1):
         sym = r["symbol"]
 
-        # Ex: CoinGecko renvoie parfois des symboles non disponibles sur CryptoCompare
         try:
             price_live = get_live_price_cc(sym, tsym)
 
-            # Daily histo jusqu'à la date ref (toTs)
             to_ts = int(datetime(ref_date.year, ref_date.month, ref_date.day, tzinfo=timezone.utc).timestamp())
             dfd = get_histoday_cc(sym, tsym, limit=400, to_ts=to_ts)
 
@@ -329,10 +382,44 @@ def main():
 
     st.caption(" | ".join(info_parts))
 
+    # --- TABLE ---
     st.dataframe(format_table(out, show_15h=show_15h), use_container_width=True)
 
     if skipped:
         st.warning("Symboles ignorés (pas dispo / erreur provider) : " + ", ".join(skipped))
+
+    # --- GRAPH AFTER TABLE ---
+    if show_graph and not out.empty:
+        st.subheader("Graphique — Indice Base 100 (tous les lundis 2025 à 15:00 Paris, Close 1H)")
+
+        # Sélection coin pour le graphique (basé sur la table actuelle)
+        symbols = out["Symbol"].dropna().unique().tolist()
+        default_symbol = symbols[0] if symbols else "BTC"
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            graph_symbol = st.selectbox("Crypto (graph)", options=symbols, index=0)
+
+        # Construction série (cache 1h)
+        serie = build_monday_15h_index_2025(graph_symbol, tsym, hour=15)
+
+        if serie.empty or serie["Index (Base 100)"].dropna().empty:
+            st.warning("Impossible de construire la série (données manquantes). Essaie un autre symbole.")
+        else:
+            # Petite table de contrôle
+            with col2:
+                st.caption("Interprétation : l’indice démarre à 100 au 1er lundi 2025 (15:00 Paris). "
+                           "S’il monte, la crypto a progressé entre les lundis ; s’il baisse, elle a reculé.")
+
+            st.dataframe(
+                serie[["Monday", "Price (Close 1H @ 15:00 Paris)", "Index (Base 100)"]].copy(),
+                use_container_width=True
+            )
+
+            chart_df = serie[["Monday", "Index (Base 100)"]].set_index("Monday")
+            st.line_chart(chart_df)
+
+    # fin main
 
 
 if __name__ == "__main__":

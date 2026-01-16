@@ -6,48 +6,45 @@ import streamlit as st
 from datetime import datetime, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
+# ---------- CONFIG ----------
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-BINANCE_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-BINANCE_TICKER_PRICE = "https://api.binance.com/api/v3/ticker/price"
+
+# CryptoCompare (min-api)
+CC_PRICE = "https://min-api.cryptocompare.com/data/price"
+CC_HISTODAY = "https://min-api.cryptocompare.com/data/v2/histoday"
+CC_HISTOHOUR = "https://min-api.cryptocompare.com/data/v2/histohour"
 
 INTERVAL = "1d"
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 
-def safe_get_json(url: str, params: dict | None = None, timeout: int = 30, tries: int = 4):
+# ---------- HELPERS ----------
+def _cc_headers() -> dict:
+    # CryptoCompare recommande l'auth en header: Authorization: Apikey <key>
+    api_key = st.secrets.get("CRYPTOCOMPARE_API_KEY", "")
+    return {"Authorization": f"Apikey {api_key}", "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+
+def safe_get_json(url: str, params: dict | None = None, timeout: int = 30, tries: int = 4) -> dict:
     """
-    Requête HTTP robuste pour Streamlit Cloud (IP partagée => rate limit / blocage possible).
-    - Ajoute un User-Agent
-    - Retry + backoff sur 429/5xx et erreurs réseau
+    GET robuste (retry + backoff) — utile sur Cloud.
     """
     last_exc = None
     for attempt in range(1, tries + 1):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (StreamlitApp; +https://streamlit.io)",
-                    "Accept": "application/json",
-                },
-            )
-
+            r = requests.get(url, params=params, timeout=timeout, headers=_cc_headers())
             # Retry sur rate limit / erreurs temporaires
             if r.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
-
             r.raise_for_status()
             return r.json()
-
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
             last_exc = e
-            time.sleep(2 ** (attempt - 1))  # 1s,2s,4s,8s
-
+            time.sleep(2 ** (attempt - 1))
     raise last_exc
 
 
+# ---------- COINGECKO ----------
 @st.cache_data(ttl=1800)  # 30 min
 def get_top_coins(vs_currency: str, top_n: int) -> pd.DataFrame:
     params = {
@@ -57,143 +54,108 @@ def get_top_coins(vs_currency: str, top_n: int) -> pd.DataFrame:
         "page": 1,
         "sparkline": "false",
     }
-
-    try:
-        data = safe_get_json(COINGECKO_URL, params=params, timeout=30, tries=4)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        st.error(f"CoinGecko inaccessible (HTTP {code}). Réessaie dans 1–2 minutes.")
-        st.stop()
-    except Exception:
-        st.error("CoinGecko inaccessible (erreur réseau). Réessaie dans 1–2 minutes.")
-        st.stop()
-
+    r = requests.get(COINGECKO_URL, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
     df = pd.DataFrame(data)[["market_cap_rank", "name", "symbol"]]
     df["symbol"] = df["symbol"].str.upper()
     return df.sort_values("market_cap_rank")
 
 
-@st.cache_data(ttl=3600)  # 1h
-def get_binance_symbols_set() -> set[str]:
+# ---------- CRYPTOCOMPARE ----------
+@st.cache_data(ttl=30)  # 30s
+def get_live_price_cc(fsym: str, tsym: str) -> float:
+    """
+    Prix live (dernier prix agrégé CryptoCompare).
+    """
     try:
-        info = safe_get_json(BINANCE_EXCHANGE_INFO, params=None, timeout=30, tries=4)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        st.error(
-            f"Binance exchangeInfo inaccessible (HTTP {code}). "
-            "Sur Streamlit Cloud, Binance peut bloquer/rate-limit l’IP. Réessaie plus tard."
-        )
-        st.stop()
-    except Exception:
-        st.error(
-            "Binance exchangeInfo inaccessible (erreur réseau). "
-            "Sur Streamlit Cloud, Binance peut bloquer/rate-limit l’IP. Réessaie plus tard."
-        )
-        st.stop()
-
-    return {s["symbol"] for s in info["symbols"] if s.get("status") == "TRADING"}
-
-
-@st.cache_data(ttl=30)  # 30s : prix live
-def get_live_price(symbol: str) -> float:
-    try:
-        data = safe_get_json(BINANCE_TICKER_PRICE, params={"symbol": symbol}, timeout=10, tries=3)
-        return float(data["price"])
+        data = safe_get_json(CC_PRICE, params={"fsym": fsym, "tsyms": tsym}, timeout=15, tries=3)
+        return float(data.get(tsym, np.nan))
     except Exception:
         return np.nan
 
 
-@st.cache_data(ttl=3600)  # historique intraday (15:00) : cache long
-def get_price_at_paris_time(symbol: str, ref_date: date, hour: int = 15, minute: int = 0, interval: str = "1m"):
+@st.cache_data(ttl=600)  # 10 min
+def get_histoday_cc(fsym: str, tsym: str, limit: int = 400, to_ts: int | None = None) -> pd.DataFrame:
     """
-    Prix à ~15:00 heure de Paris (DST auto).
+    Daily OHLCV (CryptoCompare). Retourne close + volumeto (proxy liquidité en monnaie tsym).
     """
-    target_paris = datetime.combine(ref_date, dtime(hour=hour, minute=minute), tzinfo=PARIS_TZ)
-    target_utc = target_paris.astimezone(timezone.utc)
-    target_ms = int(target_utc.timestamp() * 1000)
+    params = {"fsym": fsym, "tsym": tsym, "limit": int(limit)}
+    if to_ts is not None:
+        params["toTs"] = int(to_ts)
 
-    start_ms = target_ms - 3 * 60_000
-    end_ms = target_ms + 3 * 60_000
+    j = safe_get_json(CC_HISTODAY, params=params, timeout=30, tries=4)
+
+    # Structure v2: {"Response":"Success","Data":{"Data":[...]}}
+    if j.get("Response") != "Success":
+        raise requests.HTTPError(f"CryptoCompare histoday error: {j.get('Message', 'Unknown')}")
+
+    rows = j["Data"]["Data"]
+    df = pd.DataFrame(rows)
+
+    # champs usuels: time, close, volumeto, volumefrom, open, high, low
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df["date_utc"] = df["time"].dt.date
+
+    for c in ["close", "volumeto", "volumefrom"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df[["date_utc", "time", "close", "volumeto", "volumefrom"]].dropna()
+
+
+@st.cache_data(ttl=3600)  # 1h
+def get_price_at_paris_15h_cc(fsym: str, tsym: str, ref_date: date, hour: int = 15) -> tuple[float, datetime | None]:
+    """
+    Prix au plus proche de 15:00 Europe/Paris via histohour.
+    On récupère un petit bloc d'heures autour de l'instant cible (UTC) et on prend l'heure la plus proche.
+    """
+    target_paris = datetime.combine(ref_date, dtime(hour=hour, minute=0), tzinfo=PARIS_TZ)
+    target_utc = target_paris.astimezone(timezone.utc)
+    target_ts = int(target_utc.timestamp())
 
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "startTime": start_ms,
-        "endTime": end_ms,
-        "limit": 10,
+        "fsym": fsym,
+        "tsym": tsym,
+        "limit": 6,     # quelques heures autour
+        "toTs": target_ts,
     }
 
     try:
-        klines = safe_get_json(BINANCE_KLINES, params=params, timeout=20, tries=3)
+        j = safe_get_json(CC_HISTOHOUR, params=params, timeout=30, tries=4)
+        if j.get("Response") != "Success":
+            return np.nan, None
+
+        rows = j["Data"]["Data"]
+        if not rows:
+            return np.nan, None
+
+        best = None
+        best_diff = None
+        for r in rows:
+            t = int(r["time"])
+            diff = abs(t - target_ts)
+            if best is None or diff < best_diff:
+                best = r
+                best_diff = diff
+
+        if best is None:
+            return np.nan, None
+
+        used_time_utc = datetime.fromtimestamp(int(best["time"]), tz=timezone.utc)
+        price_close = float(best.get("close", np.nan))
+        return price_close, used_time_utc
+
     except Exception:
         return np.nan, None
 
-    if not klines:
-        return np.nan, None
 
-    best = None
-    best_diff = None
-    for k in klines:
-        ot = int(k[0])
-        diff = abs(ot - target_ms)
-        if best is None or diff < best_diff:
-            best = k
-            best_diff = diff
-
-    if best is None:
-        return np.nan, None
-
-    open_time_utc = datetime.fromtimestamp(int(best[0]) / 1000, tz=timezone.utc)
-    price_close = float(best[4])  # close
-    return price_close, open_time_utc
-
-
-@st.cache_data(ttl=300)  # 5 min : historique daily
-def get_klines(symbol: str, interval: str = "1d", limit: int = 400) -> pd.DataFrame:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-
-    try:
-        klines = safe_get_json(BINANCE_KLINES, params=params, timeout=30, tries=4)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        st.error(f"Binance klines inaccessible pour {symbol} (HTTP {code}).")
-        st.stop()
-    except Exception:
-        st.error(f"Binance klines inaccessible pour {symbol} (erreur réseau).")
-        st.stop()
-
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
-    ]
-    df = pd.DataFrame(klines, columns=cols)
-
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-
-    for c in ["close", "volume", "quote_asset_volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["date_utc"] = df["open_time"].dt.date
-    return df[["date_utc", "open_time", "close_time", "close", "volume", "quote_asset_volume"]].dropna()
-
-
-def get_close_on_or_before(df: pd.DataFrame, ref_date: date):
-    if df.empty:
-        return np.nan, None, None
-
-    available_dates = sorted(df["date_utc"].unique())
-    candidates = [x for x in available_dates if x <= ref_date]
-    if not candidates:
-        return np.nan, None, None
-
-    d = candidates[-1]
-    row = df.loc[df["date_utc"] == d].sort_values("open_time").iloc[-1]
-    return float(row["close"]), d, row["close_time"]
-
-
-def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int):
+# ---------- METRICS ----------
+def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int) -> tuple[float, float, date | None]:
+    """
+    Volatilité = std des rendements log sur la fenêtre
+    Liquidité (proxy) = moyenne de volumeto sur la fenêtre (volume en monnaie tsym)
+    """
     if df.empty:
         return np.nan, np.nan, None
 
@@ -214,124 +176,141 @@ def compute_metrics(df: pd.DataFrame, ref_date: date, window_days: int):
     closes = w["close"].to_numpy()
     log_returns = np.log(closes[1:] / closes[:-1])
     vol = float(np.std(log_returns, ddof=1))
-    liq = float(w["quote_asset_volume"].mean())
+
+    liq = float(w["volumeto"].mean())  # proxy liquidité (volume "quote" tsym)
     return vol, liq, d
 
 
-def format_table(out: pd.DataFrame) -> pd.DataFrame:
+def get_close_on_or_before(df: pd.DataFrame, ref_date: date) -> tuple[float, date | None]:
+    if df.empty:
+        return np.nan, None
+    available_dates = sorted(df["date_utc"].unique())
+    candidates = [x for x in available_dates if x <= ref_date]
+    if not candidates:
+        return np.nan, None
+    d = candidates[-1]
+    close_price = float(df.loc[df["date_utc"] == d, "close"].iloc[-1])
+    return close_price, d
+
+
+def format_table(out: pd.DataFrame, show_15h: bool) -> pd.DataFrame:
     out2 = out.copy()
 
     def r2(x): return None if pd.isna(x) else round(float(x), 2)
     def r6(x): return None if pd.isna(x) else round(float(x), 6)
 
     out2["Price (Live)"] = out2["Price (Live)"].map(r2)
-    out2["Price (15:00 Paris)"] = out2["Price (15:00 Paris)"].map(r2)
     out2["Price (Close 1D)"] = out2["Price (Close 1D)"].map(r2)
+    if show_15h and "Price (15:00 Paris)" in out2.columns:
+        out2["Price (15:00 Paris)"] = out2["Price (15:00 Paris)"].map(r2)
 
     out2["Volatility"] = out2["Volatility"].map(r6)
     out2["Liquidity"] = out2["Liquidity"].map(lambda x: None if pd.isna(x) else round(float(x), 2))
     out2["Score"] = out2["Score"].map(lambda x: None if pd.isna(x) else round(float(x), 2))
     out2["%"] = out2["%"].map(lambda x: None if pd.isna(x) else round(float(x), 2))
 
-    cols = [
-        "Rank (MC)", "Crypto", "Symbol",
-        "Price (Live)", "Price (15:00 Paris)", "Price (Close 1D)",
-        "Volatility", "Liquidity", "Score", "%"
-    ]
+    cols = ["Rank (MC)", "Crypto", "Symbol", "Price (Live)"]
+    if show_15h:
+        cols += ["Price (15:00 Paris)"]
+    cols += ["Price (Close 1D)", "Volatility", "Liquidity", "Score", "%"]
     return out2[cols]
 
 
+# ---------- APP ----------
 def main():
     st.set_page_config(page_title="Crypto Volatility x Liquidity", layout="wide")
-    st.title("Top 10 Crypto — Volatilité & Liquidité (CoinGecko + Binance)")
+    st.title("Top Crypto — Volatilité & Liquidité (CoinGecko + CryptoCompare)")
 
     with st.sidebar:
         st.subheader("Paramètres")
+
         vs_currency = st.selectbox("Devise (CoinGecko)", ["usd", "eur"], index=0)
         top_n = st.number_input("Top N", min_value=5, max_value=50, value=10, step=1)
         window_days = st.slider("Fenêtre (N jours)", min_value=7, max_value=120, value=30, step=1)
-        quote = st.selectbox("Paire Binance (quote)", ["USDT"], index=0)
-
-        ref_date = st.date_input("Date de référence (Close 1D + métriques)", value=datetime.utcnow().date())
+        ref_date = st.date_input("Date de référence (daily)", value=datetime.utcnow().date())
         show_15h = st.checkbox("Afficher Price (15:00 Paris)", value=True)
 
         run = st.button("Calculer / Rafraîchir")
 
+    # Mapping devise -> tsym CryptoCompare
+    tsym = "USD" if vs_currency.lower() == "usd" else "EUR"
+
     st.caption(
-        "Prix : "
-        "**Price (Live)** = dernier prix échangé (Binance) = TradingView (Last). "
-        "**Price (15:00 Paris)** = close de la bougie 1m autour de 15:00 Europe/Paris (DST auto). "
-        "**Price (Close 1D)** = clôture daily Binance en UTC. "
-        "Daily Binance : 00:00 → 23:59 UTC."
+        "Sources : CoinGecko (Top coins) + CryptoCompare (prix + OHLCV + volumes). "
+        "Interprétation simple : plus la **Volatility** est grande, plus ça bouge ; plus la **Liquidity** est grande, "
+        "plus ça se trade (volume). **Score = Volatility × Liquidity** ; **%** = part du score dans le total."
     )
 
     if not run:
         st.info("Clique sur « Calculer / Rafraîchir » pour générer le tableau.")
         return
 
+    # Vérif secret
+    if not st.secrets.get("CRYPTOCOMPARE_API_KEY"):
+        st.error("Secret manquant : CRYPTOCOMPARE_API_KEY. Va dans Streamlit Cloud → Settings → Secrets.")
+        st.stop()
+
     top = get_top_coins(vs_currency, int(top_n))
-    tradable = get_binance_symbols_set()
 
     rows = []
     skipped = []
     used_dates = set()
-    used_close_times = []
     used_15h_times = []
 
-    progress = st.progress(0)
+    progress = st.progress(0.0)
+
     for i, (_, r) in enumerate(top.iterrows(), start=1):
         sym = r["symbol"]
-        pair = f"{sym}{quote}"
 
-        if pair not in tradable:
-            skipped.append(pair)
-            progress.progress(i / len(top))
-            continue
+        # Ex: CoinGecko renvoie parfois des symboles non disponibles sur CryptoCompare
+        try:
+            price_live = get_live_price_cc(sym, tsym)
 
-        price_live = get_live_price(pair)
+            # Daily histo jusqu'à la date ref (toTs)
+            to_ts = int(datetime(ref_date.year, ref_date.month, ref_date.day, tzinfo=timezone.utc).timestamp())
+            dfd = get_histoday_cc(sym, tsym, limit=400, to_ts=to_ts)
 
-        price_15h = np.nan
-        time_15h_utc = None
-        if show_15h:
-            price_15h, time_15h_utc = get_price_at_paris_time(pair, ref_date, hour=15, minute=0, interval="1m")
-            if time_15h_utc is not None:
-                used_15h_times.append(time_15h_utc)
+            price_close_1d, used_date_close = get_close_on_or_before(dfd, ref_date)
+            vol, liq, used_date_metrics = compute_metrics(dfd, ref_date, int(window_days))
 
-        k = get_klines(pair, INTERVAL, limit=400)
+            used_date = used_date_metrics if used_date_metrics is not None else used_date_close
+            if used_date:
+                used_dates.add(used_date)
 
-        price_close_1d, used_date_price, close_time_utc = get_close_on_or_before(k, ref_date)
-        vol, liq, used_date_metrics = compute_metrics(k, ref_date, int(window_days))
+            price_15h = np.nan
+            if show_15h:
+                price_15h, used_15h_utc = get_price_at_paris_15h_cc(sym, tsym, ref_date, hour=15)
+                if used_15h_utc is not None:
+                    used_15h_times.append(used_15h_utc)
 
-        used_date = used_date_metrics if used_date_metrics is not None else used_date_price
-        if used_date:
-            used_dates.add(used_date)
-        if close_time_utc is not None:
-            used_close_times.append(close_time_utc)
+            row_out = {
+                "Rank (MC)": int(r["market_cap_rank"]),
+                "Crypto": r["name"],
+                "Symbol": sym,
+                "Price (Live)": price_live,
+                "Price (Close 1D)": price_close_1d,
+                "Volatility": vol,
+                "Liquidity": liq,
+            }
+            if show_15h:
+                row_out["Price (15:00 Paris)"] = price_15h
 
-        rows.append({
-            "Rank (MC)": int(r["market_cap_rank"]),
-            "Crypto": r["name"],
-            "Symbol": sym,
-            "Price (Live)": price_live,
-            "Price (15:00 Paris)": price_15h,
-            "Price (Close 1D)": price_close_1d,
-            "Volatility": vol,
-            "Liquidity": liq,
-        })
+            rows.append(row_out)
+
+        except Exception:
+            skipped.append(sym)
+
         progress.progress(i / len(top))
 
     progress.empty()
 
     if not rows:
-        st.error("Aucune donnée récupérée depuis Binance pour les coins sélectionnés.")
+        st.error("Aucune donnée exploitable. Vérifie la clé CryptoCompare et réessaie.")
         if skipped:
-            st.write("Paires ignorées :", ", ".join(skipped))
+            st.write("Symboles ignorés :", ", ".join(skipped))
         return
 
     out = pd.DataFrame(rows)
-
-    if not show_15h and "Price (15:00 Paris)" in out.columns:
-        out = out.drop(columns=["Price (15:00 Paris)"])
 
     out["Score"] = out["Volatility"] * out["Liquidity"]
     total_score = out["Score"].sum(skipna=True)
@@ -341,24 +320,19 @@ def main():
     effective_date = max(used_dates) if used_dates else ref_date
 
     info_parts = [
-        f"Date utilisée (daily/métriques) : {effective_date}",
+        f"Devise : {tsym}",
+        f"Date utilisée (daily) : {effective_date}",
         f"Fenêtre : {window_days} jours",
-        f"Quote : {quote}"
     ]
-    if used_close_times:
-        info_parts.append(f"Clôture daily (UTC) : {max(used_close_times).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     if show_15h and used_15h_times:
         info_parts.append(f"Point 15:00 Paris (UTC utilisé) : {max(used_15h_times).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     st.caption(" | ".join(info_parts))
 
-    st.dataframe(
-        format_table(out) if show_15h else format_table(out.drop(columns=["Price (15:00 Paris)"], errors="ignore")),
-        use_container_width=True
-    )
+    st.dataframe(format_table(out, show_15h=show_15h), use_container_width=True)
 
     if skipped:
-        st.warning("Paires absentes sur Binance (ignorées) : " + ", ".join(skipped))
+        st.warning("Symboles ignorés (pas dispo / erreur provider) : " + ", ".join(skipped))
 
 
 if __name__ == "__main__":

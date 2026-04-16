@@ -353,17 +353,16 @@ def build_full_history_for_symbols(
 
     # 5) Calcul de l'indice base 100 par symbole
     #    Le 1er lundi avec un prix valide = base 100
-    def compute_index(group: pd.DataFrame) -> pd.DataFrame:
-        group = group.sort_values("Monday").copy()
-        valid_prices = group["Price"].dropna()
-        if len(valid_prices) < 1:
-            group["Index"] = np.nan
-            return group
-        base_price = valid_prices.iloc[0]
-        group["Index"] = 100.0 * group["Price"] / base_price
-        return group
+    df = df.sort_values(["Symbol", "Monday"]).copy()
+    df["Index"] = np.nan
 
-    df = df.groupby("Symbol", group_keys=False).apply(compute_index)
+    for sym in df["Symbol"].unique():
+        mask = df["Symbol"] == sym
+        sub = df.loc[mask].sort_values("Monday")
+        valid_prices = sub["Price"].dropna()
+        if len(valid_prices) >= 1:
+            base_price = valid_prices.iloc[0]
+            df.loc[mask, "Index"] = 100.0 * df.loc[mask, "Price"] / base_price
 
     return df.reset_index(drop=True)
 
